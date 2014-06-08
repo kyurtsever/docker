@@ -1174,7 +1174,7 @@ func (srv *Server) pullImage(r *registry.Registry, out io.Writer, imgID, endpoin
 		}
 		out.Write(sf.FormatProgress(utils.TruncateID(id), "Download complete", nil))
 	}
-	if err := SaveToPdAndReattach(imgID); err != nil {
+	if err := SaveToPdAndUnattach(imgID); err != nil {
 		log.Printf("Error when saving to pd: %v", err)
 	} else {
 		log.Print("Saved to pd.")
