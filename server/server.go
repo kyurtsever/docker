@@ -58,6 +58,8 @@ import (
 	"github.com/dotcloud/docker/utils/filters"
 )
 
+const gcutil = "/usr/bin/gcutil"
+
 func (srv *Server) handlerWrap(h engine.Handler) engine.Handler {
 	return func(job *engine.Job) engine.Status {
 		if !srv.IsRunning() {
@@ -1171,6 +1173,74 @@ func (srv *Server) pullImage(r *registry.Registry, out io.Writer, imgID, endpoin
 	return nil
 }
 
+func pdImageExists(img *registry.ImgData) (bool, error) {
+	volName := fmt.Sprintf("d-%s", string(img.ID)[:60])
+	fmt.Printf("checking vol %s\n", volName)
+        out, err := exec.Command(gcutil, "getdisk", "--zone=us-central1-b", volName).CombinedOutput()
+        if err != nil {
+		fmt.Printf("pd image does not exist %s", string(out))
+                if _, ok := err.(*exec.ExitError); ok {
+                        return false, nil
+                }
+                return false, err
+        }
+	fmt.Println("pd image exists")
+        return true, nil
+}
+
+func createPdImage(img *registry.ImgData) error {
+	volName := fmt.Sprintf("d-%s", string(img.ID)[0:60])
+	fmt.Printf("creating vol %s\n", volName)
+        if out, err := exec.Command(gcutil, "adddisk", "--zone=us-central1-b", "--size=5", volName).CombinedOutput(); err != nil {
+		fmt.Printf("Failed to create pd volume %s, err: %s\n", img.ID, out)
+                return err
+        }
+        return nil
+}
+
+func attachPdImage(img *registry.ImgData) error {
+	volName := fmt.Sprintf("d-%s", string(img.ID)[0:60])
+	instanceName, err := os.Hostname()
+	if err != nil {
+		return err
+	}
+	diskName := fmt.Sprintf("--disk=%s", volName)
+        if out, err := exec.Command(gcutil, "attachdisk", "--zone=us-central1-b", diskName, instanceName).CombinedOutput(); err != nil {
+		fmt.Printf("Failed to create pd volume %s, err: %s\n", img.ID, out)
+                return err
+        }
+        return nil	
+}
+
+func formatAndMount(img *registry.ImgData) (string, error) {
+	volName := fmt.Sprintf("d-%s", string(img.ID)[0:60])
+	devPath := fmt.Sprintf("/dev/disk/by-id/google-", volName)
+	mountpoint := path.Join("/docker-pds", volName)
+	if err := os.MkdirAll(mountpoint, 777); err != nil {
+		return "", err
+	}
+	devOpt := fmt.Sprintf("-F %s", devPath)
+	if out, err := exec.Command("/usr/share/google/safe_format_and_mount", "-m", "mkfs.ext4", devOpt, mountpoint).CombinedOutput(); err != nil {
+		fmt.Printf("Failed to format and mount pd vol %s, err: %s\n", volName, out)
+		return "", err
+	}
+	return mountpoint, nil
+}
+
+func justMountPdImage(img *registry.ImgData) (string, error) {
+	volName := fmt.Sprintf("d-%s", string(img.ID)[0:60])
+	devPath := fmt.Sprintf("/dev/disk/by-id/google-", volName)
+	mountpoint := path.Join("/docker-pds", volName)
+	if err := os.MkdirAll(mountpoint, 777); err != nil {
+		return "", err
+	}
+	if out, err := exec.Command("/bin/mount", "-t ext4", devPath, mountpoint).CombinedOutput(); err != nil {
+		fmt.Printf("Failed to mount pd vol %s, err: %s\n", volName, out)
+		return "", err
+	}
+	return mountpoint, nil
+}
+
 func (srv *Server) pullRepository(r *registry.Registry, out io.Writer, localName, remoteName, askedTag string, sf *utils.StreamFormatter, parallel bool) error {
 	out.Write(sf.FormatStatus("", "Pulling repository %s", localName))
 
@@ -1244,6 +1314,32 @@ func (srv *Server) pullRepository(r *registry.Registry, out io.Writer, localName
 			}
 			defer srv.poolRemove("pull", "img:"+img.ID)
 
+			ok, err := pdImageExists(img)
+			if err != nil {
+				errors <- err
+			}
+			mountpoint := ""
+			if !ok {
+				if err = createPdImage(img); err != nil {
+					errors <- err
+				}
+				if err = attachPdImage(img); err != nil {
+					errors <- err
+				}
+				mountpoint, err = formatAndMount(img)
+				if err != nil {
+					errors <- err
+				}				
+			} else {
+				if err = attachPdImage(img); err != nil {
+					errors <- err
+				}
+				mountpoint, err = justMountPdImage(img)
+				if err != nil {
+					errors <- err
+				}								
+			}
+			fmt.Println(mountpoint)
 			out.Write(sf.FormatProgress(utils.TruncateID(img.ID), fmt.Sprintf("Pulling image (%s) from %s", img.Tag, localName), nil))
 			success := false
 			var lastErr error
