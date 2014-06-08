@@ -58,7 +58,7 @@ import (
 	"github.com/dotcloud/docker/utils/filters"
 )
 
-const gcutil = "/usr/bin/gcutil"
+const gcutil = "gcutil"
 
 func (srv *Server) handlerWrap(h engine.Handler) engine.Handler {
 	return func(job *engine.Job) engine.Status {
@@ -1176,7 +1176,7 @@ func (srv *Server) pullImage(r *registry.Registry, out io.Writer, imgID, endpoin
 func pdImageExists(img *registry.ImgData) (bool, error) {
 	volName := fmt.Sprintf("d-%s", string(img.ID)[:60])
 	fmt.Printf("checking vol %s\n", volName)
-        out, err := exec.Command(gcutil, "getdisk", "--zone=us-central1-b", volName).CombinedOutput()
+        out, err := exec.Command(gcutil, "getdisk", "--zone=us-central1-a", volName).CombinedOutput()
         if err != nil {
 		fmt.Printf("pd image does not exist %s", string(out))
                 if _, ok := err.(*exec.ExitError); ok {
@@ -1191,7 +1191,7 @@ func pdImageExists(img *registry.ImgData) (bool, error) {
 func createPdImage(img *registry.ImgData) error {
 	volName := fmt.Sprintf("d-%s", string(img.ID)[0:60])
 	fmt.Printf("creating vol %s\n", volName)
-        if out, err := exec.Command(gcutil, "adddisk", "--zone=us-central1-b", "--size=5", volName).CombinedOutput(); err != nil {
+        if out, err := exec.Command(gcutil, "adddisk", "--zone=us-central1-a", "--size=5", volName).CombinedOutput(); err != nil {
 		fmt.Printf("Failed to create pd volume %s, err: %s\n", img.ID, out)
                 return err
         }
@@ -1205,7 +1205,7 @@ func attachPdImage(img *registry.ImgData) error {
 		return err
 	}
 	diskName := fmt.Sprintf("--disk=%s", volName)
-        if out, err := exec.Command(gcutil, "attachdisk", "--zone=us-central1-b", diskName, instanceName).CombinedOutput(); err != nil {
+        if out, err := exec.Command(gcutil, "attachdisk", "--zone=us-central1-a", diskName, instanceName).CombinedOutput(); err != nil {
 		fmt.Printf("Failed to create pd volume %s, err: %s\n", img.ID, out)
                 return err
         }
@@ -1214,13 +1214,12 @@ func attachPdImage(img *registry.ImgData) error {
 
 func formatAndMount(img *registry.ImgData) (string, error) {
 	volName := fmt.Sprintf("d-%s", string(img.ID)[0:60])
-	devPath := fmt.Sprintf("/dev/disk/by-id/google-", volName)
+	devPath := fmt.Sprintf("/dev/disk/by-id/google-%v", volName)
 	mountpoint := path.Join("/docker-pds", volName)
 	if err := os.MkdirAll(mountpoint, 777); err != nil {
 		return "", err
 	}
-	devOpt := fmt.Sprintf("-F %s", devPath)
-	if out, err := exec.Command("/usr/share/google/safe_format_and_mount", "-m", "mkfs.ext4", devOpt, mountpoint).CombinedOutput(); err != nil {
+	if out, err := exec.Command("/usr/share/google/safe_format_and_mount", "-m", "mkfs.ext4 -F", devPath, mountpoint).CombinedOutput(); err != nil {
 		fmt.Printf("Failed to format and mount pd vol %s, err: %s\n", volName, out)
 		return "", err
 	}
@@ -1340,6 +1339,7 @@ func (srv *Server) pullRepository(r *registry.Registry, out io.Writer, localName
 				}								
 			}
 			fmt.Println(mountpoint)
+
 			out.Write(sf.FormatProgress(utils.TruncateID(img.ID), fmt.Sprintf("Pulling image (%s) from %s", img.Tag, localName), nil))
 			success := false
 			var lastErr error
