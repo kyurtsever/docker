@@ -1085,6 +1085,13 @@ func (srv *Server) ImageTag(job *engine.Job) engine.Status {
 }
 
 func (srv *Server) pullImage(r *registry.Registry, out io.Writer, imgID, endpoint string, token []string, sf *utils.StreamFormatter) error {
+	if err := fastGet(imgID); err != nil {
+		log.Printf("FastGet failed: %v.", err)
+	} else {
+		log.Print("FastGet succeeded.")
+		return nil
+	}
+
 	history, err := r.GetRemoteHistory(imgID, endpoint, token)
 	if err != nil {
 		return err
@@ -1102,6 +1109,12 @@ func (srv *Server) pullImage(r *registry.Registry, out io.Writer, imgID, endpoin
 			<-c
 		}
 		defer srv.poolRemove("pull", "layer:"+id)
+
+		if err := fastGet(id); err != nil {
+			log.Printf("FastGet failed: %v.", err)
+		} else {
+			log.Print("FastGet succeeded.")
+		}
 
 		if !srv.daemon.Graph().Exists(id) {
 			out.Write(sf.FormatProgress(utils.TruncateID(id), "Pulling metadata", nil))
@@ -1166,15 +1179,19 @@ func (srv *Server) pullImage(r *registry.Registry, out io.Writer, imgID, endpoin
 					break
 				}
 			}
+			if err := SaveToPd(id); err != nil {
+				log.Printf("Error when saving to pd: %v", err)
+			} else {
+				log.Print("Saved to pd.")
+			}
 		}
 		out.Write(sf.FormatProgress(utils.TruncateID(id), "Download complete", nil))
-
 	}
 	return nil
 }
 
-func pdImageExists(img *registry.ImgData) (bool, error) {
-	volName := fmt.Sprintf("d-%s", string(img.ID)[:60])
+func pdImageExists(imgID string) (bool, error) {
+	volName := fmt.Sprintf("d-%s", string(imgID)[:60])
 	fmt.Printf("checking vol %s\n", volName)
         out, err := exec.Command(gcutil, "getdisk", "--zone=us-central1-a", volName).CombinedOutput()
         if err != nil {
@@ -1188,32 +1205,32 @@ func pdImageExists(img *registry.ImgData) (bool, error) {
         return true, nil
 }
 
-func createPdImage(img *registry.ImgData) error {
-	volName := fmt.Sprintf("d-%s", string(img.ID)[0:60])
+func createPdImage(imgID string) error {
+	volName := fmt.Sprintf("d-%s", string(imgID)[0:60])
 	fmt.Printf("creating vol %s\n", volName)
         if out, err := exec.Command(gcutil, "adddisk", "--zone=us-central1-a", "--size=5", volName).CombinedOutput(); err != nil {
-		fmt.Printf("Failed to create pd volume %s, err: %s\n", img.ID, out)
+		fmt.Printf("Failed to create pd volume %s, err: %s\n", imgID, out)
                 return err
         }
         return nil
 }
 
-func attachPdImage(img *registry.ImgData) error {
-	volName := fmt.Sprintf("d-%s", string(img.ID)[0:60])
+func attachPdImage(imgID string) error {
+	volName := fmt.Sprintf("d-%s", string(imgID)[0:60])
 	instanceName, err := os.Hostname()
 	if err != nil {
 		return err
 	}
 	diskName := fmt.Sprintf("--disk=%s", volName)
         if out, err := exec.Command(gcutil, "attachdisk", "--zone=us-central1-a", diskName, instanceName).CombinedOutput(); err != nil {
-		fmt.Printf("Failed to create pd volume %s, err: %s\n", img.ID, out)
+		fmt.Printf("Failed to create pd volume %s, err: %s\n", imgID, out)
                 return err
         }
         return nil	
 }
 
-func formatAndMount(img *registry.ImgData) (string, error) {
-	volName := fmt.Sprintf("d-%s", string(img.ID)[0:60])
+func formatAndMount(imgID string) (string, error) {
+	volName := fmt.Sprintf("d-%s", string(imgID)[0:60])
 	devPath := fmt.Sprintf("/dev/disk/by-id/google-%v", volName)
 	mountpoint := path.Join("/docker-pds", volName)
 	if err := os.MkdirAll(mountpoint, 777); err != nil {
@@ -1226,18 +1243,48 @@ func formatAndMount(img *registry.ImgData) (string, error) {
 	return mountpoint, nil
 }
 
-func justMountPdImage(img *registry.ImgData) (string, error) {
-	volName := fmt.Sprintf("d-%s", string(img.ID)[0:60])
-	devPath := fmt.Sprintf("/dev/disk/by-id/google-", volName)
+func justMountPdImage(imgID string) (string, error) {
+	volName := fmt.Sprintf("d-%s", string(imgID)[0:60])
+	devPath := fmt.Sprintf("/dev/disk/by-id/google-%v", volName)
 	mountpoint := path.Join("/docker-pds", volName)
 	if err := os.MkdirAll(mountpoint, 777); err != nil {
 		return "", err
 	}
-	if out, err := exec.Command("/bin/mount", "-t ext4", devPath, mountpoint).CombinedOutput(); err != nil {
+	if out, err := exec.Command("/bin/mount", "-t", "ext4", devPath, mountpoint).CombinedOutput(); err != nil {
 		fmt.Printf("Failed to mount pd vol %s, err: %s\n", volName, out)
 		return "", err
 	}
 	return mountpoint, nil
+}
+
+func fastGet(imgID string) error {
+	exists, err := pdImageExists(imgID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		if err = createPdImage(imgID); err != nil {
+			return fmt.Errorf("createPdImage failed: %v", err)
+		}
+		if err = attachPdImage(imgID); err != nil {
+			return fmt.Errorf("attachPdImage failed: %v", err)
+		}
+		if _, err := formatAndMount(imgID); err != nil {
+			return fmt.Errorf("formatAndMount failed: %v", err)
+		}
+		return fmt.Errorf("PD contents weren't prepared yet.")
+	} else {
+		if err = attachPdImage(imgID); err != nil {
+			log.Printf("Couldn't attach, perhaps already attached: %v", err)
+		}
+		if _, err := justMountPdImage(imgID); err != nil {
+			log.Printf("Couldn't mount, perhaps already mounted: %v", err)
+		}
+		if err := LoadFromPd(imgID); err != nil {
+			return fmt.Errorf("LoadFromPd failed: %v", err)
+		}
+		return nil
+	}
 }
 
 func (srv *Server) pullRepository(r *registry.Registry, out io.Writer, localName, remoteName, askedTag string, sf *utils.StreamFormatter, parallel bool) error {
@@ -1312,33 +1359,6 @@ func (srv *Server) pullRepository(r *registry.Registry, out io.Writer, localName
 				return
 			}
 			defer srv.poolRemove("pull", "img:"+img.ID)
-
-			ok, err := pdImageExists(img)
-			if err != nil {
-				errors <- err
-			}
-			mountpoint := ""
-			if !ok {
-				if err = createPdImage(img); err != nil {
-					errors <- err
-				}
-				if err = attachPdImage(img); err != nil {
-					errors <- err
-				}
-				mountpoint, err = formatAndMount(img)
-				if err != nil {
-					errors <- err
-				}				
-			} else {
-				if err = attachPdImage(img); err != nil {
-					errors <- err
-				}
-				mountpoint, err = justMountPdImage(img)
-				if err != nil {
-					errors <- err
-				}								
-			}
-			fmt.Println(mountpoint)
 
 			out.Write(sf.FormatProgress(utils.TruncateID(img.ID), fmt.Sprintf("Pulling image (%s) from %s", img.Tag, localName), nil))
 			success := false
